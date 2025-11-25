@@ -57,6 +57,8 @@ type Options struct {
 	RepoType            string `mapstructure:"repoType"`
 	RepoUrl             string `mapstructure:"repoUrl"`
 	Revision            string `mapstructure:"revision"`
+	Subdirectory        string `mapstructure:"subdirectory"`
+	UserAgent           string `mapstructure:"userAgent"`
 	ContextLines        int    `mapstructure:"contextLines"`
 	Lookback            int    `mapstructure:"lookback"`
 	UpdateSequenceId    int    `mapstructure:"updateSequenceId"`
@@ -64,7 +66,8 @@ type Options struct {
 	Debug               bool   `mapstructure:"debug"`
 	DryRun              bool   `mapstructure:"dryRun"`
 	IgnoreServiceErrors bool   `mapstructure:"ignoreServiceErrors"`
-	UserAgent           string `mapstructure:"userAgent"`
+	Prune               bool   `mapstructure:"prune"`
+	SkipArchivedFlags   bool   `mapstructure:"skipArchivedFlags"`
 
 	// The following options can only be configured via YAML configuration
 
@@ -108,9 +111,11 @@ func InitYAML() error {
 	if err != nil {
 		return err
 	}
+	subdirectoryPath := viper.GetString("subdirectory")
 	viper.SetConfigName("coderefs")
 	viper.SetConfigType("yaml")
-	viper.AddConfigPath(filepath.Join(absPath, ".launchdarkly"))
+	configPath := filepath.Join(absPath, subdirectoryPath, ".launchdarkly")
+	viper.AddConfigPath(configPath)
 	err = viper.ReadInConfig()
 	if err != nil && !errors.As(err, &viper.ConfigFileNotFoundError{}) {
 		return err
@@ -191,7 +196,7 @@ func (o Options) ValidateRequired() error {
 	}
 
 	if len(o.ProjKey) > 0 && len(o.Projects) > 0 {
-		return fmt.Errorf("`--projKey` cannot be combined with `projects` in configuration")
+		return errors.New("`--projKey` cannot be combined with `projects` in configuration")
 	}
 
 	if len(o.ProjKey) > maxProjKeyLength {
@@ -259,7 +264,7 @@ func (o Options) Validate() error {
 	}
 
 	if o.Revision != "" && o.Branch == "" {
-		return fmt.Errorf(`"branch" option is required when "revision" option is set`)
+		return errors.New(`"branch" option is required when "revision" option is set`)
 	}
 
 	if len(o.Projects) > 0 {

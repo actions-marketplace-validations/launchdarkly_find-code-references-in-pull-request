@@ -45,7 +45,7 @@ Allowed template variables: 'branchName', 'sha'. If "commitUrlTemplate" is not p
 	{
 		name:         "contextLines",
 		short:        "C",
-		defaultValue: 2,
+		defaultValue: 2, //nolint:mnd
 		usage: `The number of context lines to send to LaunchDarkly. If < 0, no
 source code will be sent to LaunchDarkly. If 0, only the lines containing
 flag references will be sent. If > 0, will send that number of context
@@ -94,7 +94,7 @@ LaunchDarkly API is unreachable or returns an unexpected response.`,
 	{
 		name:         "lookback",
 		short:        "l",
-		defaultValue: 10,
+		defaultValue: 10, //nolint:mnd
 		usage: `Sets the number of git commits to search in history for
 whether a feature flag was removed from code. May be set to 0 to disabled this feature. Setting this option to a high value will increase search time.`,
 	},
@@ -110,6 +110,11 @@ the project to this directory.`,
 		short:        "p",
 		defaultValue: "",
 		usage:        `LaunchDarkly project key. Found under Account Settings -> Projects in the LaunchDarkly dashboard. Cannot be combined with "projects" block in configuration file.`,
+	},
+	{
+		name:         "prune",
+		defaultValue: true,
+		usage:        `If enabled, branches that are not found in the remote repository will be deleted from LaunchDarkly.`,
 	},
 	{
 		name:         "repoName",
@@ -136,6 +141,19 @@ LaunchDarkly UI. Acceptable values: bitbucket|custom|github|gitlab.`,
 		short:        "R",
 		defaultValue: "",
 		usage:        `Use this option to scan non-git codebases. The current revision of the repository to be scanned. If set, the version string for the scanned repository will not be inferred, and branch garbage collection will be disabled. The "branch" option is required when "revision" is set.`,
+	},
+	{
+		name:         "skipArchivedFlags",
+		defaultValue: false,
+		usage:        `If enabled, archived feature flags will not be fetched from the LaunchDarkly API as input to the tool.`,
+	},
+	{
+		name:         "subdirectory",
+		defaultValue: "",
+		usage: `If the .launchdarkly/coderefs.yaml file is not in the root of
+the repository, provide the path to the subdirectory containing the configuration,
+relative to the root. Code references will only run on this provided subdirectory.
+This allows a monorepo to have multiple configuration files, one per subdirectory.`,
 	},
 	{
 		name:         "updateSequenceId",

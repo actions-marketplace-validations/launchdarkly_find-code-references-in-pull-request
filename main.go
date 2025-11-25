@@ -3,22 +3,23 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
 
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v68/github"
 	ghc "github.com/launchdarkly/find-code-references-in-pull-request/comments"
 	lcr "github.com/launchdarkly/find-code-references-in-pull-request/config"
 	ldiff "github.com/launchdarkly/find-code-references-in-pull-request/diff"
 	e "github.com/launchdarkly/find-code-references-in-pull-request/errors"
-	lflags "github.com/launchdarkly/find-code-references-in-pull-request/flags"
+	"github.com/launchdarkly/find-code-references-in-pull-request/internal/extinctions"
 	gha "github.com/launchdarkly/find-code-references-in-pull-request/internal/github_actions"
 	ldclient "github.com/launchdarkly/find-code-references-in-pull-request/internal/ldclient"
+	references "github.com/launchdarkly/find-code-references-in-pull-request/internal/references"
 	"github.com/launchdarkly/find-code-references-in-pull-request/search"
 	"github.com/launchdarkly/ld-find-code-refs/v2/options"
 	"github.com/sourcegraph/go-diff/diff"
@@ -41,35 +42,51 @@ func main() {
 	failExit(err)
 
 	if len(flags) == 0 {
-		gha.LogNotice("No flags found in project %s", config.LdProject)
+		gha.SetNotice("No flags found in project %s", config.LdProject)
 		os.Exit(0)
 	}
 
 	opts, err := getOptions(config)
 	failExit(err)
 
-	matcher, err := search.GetMatcher(config, opts, flags)
-	failExit(err)
+	flagKeys := make([]string, 0, len(flags))
+	for _, flag := range flags {
+		flagKeys = append(flagKeys, flag.Key)
+	}
 
+	gha.StartLogGroup("Preprocessing diffs...")
 	multiFiles, err := getDiffs(ctx, config, *event.PullRequest.Number)
 	failExit(err)
 
-	flagsRef := lflags.FlagsRef{
-		FlagsAdded:   make(lflags.FlagAliasMap),
-		FlagsRemoved: make(lflags.FlagAliasMap),
+	diffMap := ldiff.PreprocessDiffs(opts.Dir, multiFiles)
+
+	matcher, err := search.GetMatcher(opts, flagKeys, diffMap)
+	gha.EndLogGroup()
+	failExit(err)
+
+	builder := references.NewReferenceSummaryBuilder(config.MaxFlags, config.CheckExtinctions)
+	gha.StartLogGroup("Scanning diff for references...")
+	gha.Log("Searching for %d flags", len(flagKeys))
+	for _, contents := range diffMap {
+		ldiff.ProcessDiffs(matcher, contents, builder)
+	}
+	gha.EndLogGroup()
+
+	if config.CheckExtinctions {
+		if err := extinctions.CheckExtinctions(opts, builder); err != nil {
+			gha.SetWarning("Error checking for extinct flags")
+			gha.LogError(err)
+		}
 	}
 
-	for _, parsedDiff := range multiFiles {
-		getPath := ldiff.CheckDiff(parsedDiff, config.Workspace)
-		if getPath.Skip {
-			continue
-		}
-		for _, hunk := range parsedDiff.Hunks {
-			ldiff.ProcessDiffs(matcher, hunk, flagsRef, config.MaxFlags)
-		}
-	}
+	gha.Log("Summarizing results")
+	flagsRef := builder.Build()
+
+	// Set outputs
+	setOutputs(config, flagsRef)
 
 	// Add comment
+	gha.StartLogGroup("Processing comment...")
 	existingComment := checkExistingComments(event, config, ctx)
 	buildComment := ghc.ProcessFlags(flagsRef, flags, config)
 	postedComments := ghc.BuildFlagComment(buildComment, flagsRef, existingComment)
@@ -80,9 +97,15 @@ func main() {
 
 		err = postGithubComment(ctx, flagsRef, config, existingComment, *event.PullRequest.Number, comment)
 	}
+	gha.EndLogGroup()
 
-	// Set outputs
-	setOutputs(flagsRef)
+	// Add flag links
+	if config.CreateFlagLinks && postedComments != "" {
+		// if postedComments is empty, we probably already created the flag links
+		gha.StartLogGroup("Adding flag links...")
+		ldclient.CreateFlagLinks(config, flagsRef, event)
+		gha.EndLogGroup()
+	}
 
 	failExit(err)
 }
@@ -90,7 +113,7 @@ func main() {
 func checkExistingComments(event *github.PullRequestEvent, config *lcr.Config, ctx context.Context) *github.IssueComment {
 	comments, _, err := config.GHClient.Issues.ListComments(ctx, config.Owner, config.Repo, *event.PullRequest.Number, nil)
 	if err != nil {
-		log.Println(err)
+		gha.LogError(err)
 	}
 
 	for _, comment := range comments {
@@ -102,13 +125,13 @@ func checkExistingComments(event *github.PullRequestEvent, config *lcr.Config, c
 	return nil
 }
 
-func postGithubComment(ctx context.Context, flagsRef lflags.FlagsRef, config *lcr.Config, existingComment *github.IssueComment, prNumber int, comment github.IssueComment) error {
+func postGithubComment(ctx context.Context, flagsRef references.ReferenceSummary, config *lcr.Config, existingComment *github.IssueComment, prNumber int, comment github.IssueComment) error {
 	var existingCommentId int64
 	if existingComment != nil {
 		existingCommentId = existingComment.GetID()
 	}
 
-	if flagsRef.Found() {
+	if flagsRef.AnyFound() {
 		if existingCommentId > 0 {
 			_, _, err := config.GHClient.Issues.EditComment(ctx, config.Owner, config.Repo, existingCommentId, &comment)
 			return err
@@ -142,63 +165,108 @@ func postGithubComment(ctx context.Context, flagsRef lflags.FlagsRef, config *lc
 }
 
 func getDiffs(ctx context.Context, config *lcr.Config, prNumber int) ([]*diff.FileDiff, error) {
-	rawOpts := github.RawOptions{Type: github.Diff}
-	raw, resp, err := config.GHClient.PullRequests.GetRaw(ctx, config.Owner, config.Repo, prNumber, rawOpts)
+	gha.Debug("Getting pull request diff...")
+
+	var (
+		client  = config.GHClient
+		owner   = config.Owner
+		repo    = config.Repo
+		rawOpts = github.RawOptions{Type: github.Diff}
+		rawDiff []byte
+	)
+
+	raw, resp, err := client.PullRequests.GetRaw(ctx, owner, repo, prNumber, rawOpts)
+	rawDiff = []byte(raw)
 	if err != nil {
 		// TODO use this elsewhere
 		if resp.StatusCode == http.StatusUnauthorized {
 			return nil, e.UnauthorizedError
 		}
 
+		// check that git is installed
+		if _, gitCmdErr := exec.Command("git", "-v").CombinedOutput(); gitCmdErr != nil {
+			return nil, e.NoGitError
+		}
+
+		// For very large diffs, the github api will return a 406, when this
+		// happens, fallback to calling `git diff` directly
+		if resp != nil && resp.StatusCode == http.StatusNotAcceptable {
+			gha.Debug("Diff too large, fallback to traditional git command")
+			pr, _, err := client.PullRequests.Get(ctx, owner, repo, prNumber)
+			if err != nil {
+				return nil, err
+			}
+
+			headSha := pr.GetHead().GetSHA()
+
+			commitsComparison, _, err := client.Repositories.CompareCommits(ctx, owner, repo, headSha, pr.GetBase().GetSHA(), nil)
+			if err != nil {
+				return nil, err
+			}
+
+			mergeBaseSha := commitsComparison.GetMergeBaseCommit().GetSHA()
+			rawDiff, err = exec.Command("git", "diff", "--find-renames", mergeBaseSha, headSha).CombinedOutput()
+			// git diff return exit status 1 if there is a diff, so that does
+			// not indicate an error
+			if err != nil && err.Error() != "exit status 1" {
+				return nil, fmt.Errorf("failed to run git diff: %w", err)
+			}
+		}
+	}
+
+	multi, err := diff.ParseMultiFileDiff(rawDiff)
+	if err != nil {
 		return nil, err
 	}
-	return diff.ParseMultiFileDiff([]byte(raw))
+	gha.Debug("Got %d diff files", len(multi))
+
+	return multi, nil
 }
 
+// Get options from config. Note: dir will be set to workspace
 func getOptions(config *lcr.Config) (options.Options, error) {
 	// Needed for ld-find-code-refs to work as a library
 	viper.Set("dir", config.Workspace)
 	viper.Set("accessToken", config.ApiToken)
 
-	err := options.InitYAML()
-	if err != nil {
-		log.Println(err)
+	if err := options.InitYAML(); err != nil {
+		gha.LogError(err)
 	}
 	return options.GetOptions()
 }
 
-func setOutputs(flagsRef lflags.FlagsRef) {
-	flagsModified := make([]string, 0, len(flagsRef.FlagsAdded))
-	for k := range flagsRef.FlagsAdded {
-		flagsModified = append(flagsModified, k)
-	}
+func setOutputs(config *lcr.Config, flagsRef references.ReferenceSummary) {
+	gha.Debug("Setting outputs...")
+	flagsModified := flagsRef.AddedKeys()
 	setOutputsForChangedFlags("modified", flagsModified)
 
-	flagsRemoved := make([]string, 0, len(flagsRef.FlagsRemoved))
-	for k := range flagsRef.FlagsRemoved {
-		flagsRemoved = append(flagsRemoved, k)
+	flagsRemoved := flagsRef.RemovedKeys()
+	setOutputsForChangedFlags("removed", flagsRemoved)
+
+	if config.CheckExtinctions {
+		setOutputsForChangedFlags("extinct", flagsRef.ExtinctKeys())
 	}
-	setOutputsForChangedFlags("removed", flagsModified)
 
 	allChangedFlags := make([]string, 0, len(flagsModified)+len(flagsRemoved))
 	allChangedFlags = append(allChangedFlags, flagsModified...)
 	allChangedFlags = append(allChangedFlags, flagsRemoved...)
+	sort.Strings(allChangedFlags)
 	setOutputsForChangedFlags("changed", allChangedFlags)
 }
 
 func setOutputsForChangedFlags(modifier string, changedFlags []string) {
 	count := len(changedFlags)
-	gha.SetOutputOrLogError(fmt.Sprintf("any-%s", modifier), fmt.Sprintf("%t", count > 0))
-	gha.SetOutputOrLogError(fmt.Sprintf("%s-flags-count", modifier), fmt.Sprintf("%d", count))
+	gha.SetOutput(fmt.Sprintf("any-%s", modifier), fmt.Sprintf("%t", count > 0))
+	gha.SetOutput(fmt.Sprintf("%s-flags-count", modifier), fmt.Sprintf("%d", count))
 
 	sort.Strings(changedFlags)
-	gha.SetOutputOrLogError(fmt.Sprintf("%s-flags", modifier), strings.Join(changedFlags, " "))
+	gha.SetOutput(fmt.Sprintf("%s-flags", modifier), strings.Join(changedFlags, " "))
 }
 
 func failExit(err error) {
 	if err != nil {
-		gha.LogError(err.Error())
-		log.Println(err)
+		gha.LogError(err)
+		gha.SetError("%s", err.Error())
 		os.Exit(1)
 	}
 }

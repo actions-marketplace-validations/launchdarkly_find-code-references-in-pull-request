@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"html"
 	"html/template"
-	"log"
 	"reflect"
 	"sort"
 	"strings"
@@ -15,21 +14,29 @@ import (
 
 	sprig "github.com/Masterminds/sprig/v3"
 
-	"github.com/google/go-github/github"
-	ldapi "github.com/launchdarkly/api-client-go/v13"
-	"github.com/launchdarkly/find-code-references-in-pull-request/config"
+	"github.com/google/go-github/v68/github"
+
+	ldapi "github.com/launchdarkly/api-client-go/v15"
 	lcr "github.com/launchdarkly/find-code-references-in-pull-request/config"
-	lflags "github.com/launchdarkly/find-code-references-in-pull-request/flags"
+	gha "github.com/launchdarkly/find-code-references-in-pull-request/internal/github_actions"
+	refs "github.com/launchdarkly/find-code-references-in-pull-request/internal/references"
 )
 
 type Comment struct {
-	Flag       ldapi.FeatureFlag
-	ArchivedAt time.Time
-	Added      bool
-	Aliases    []string
-	ChangeType string
-	Primary    ldapi.FeatureFlagConfig
-	LDInstance string
+	FlagKey            string
+	FlagName           string
+	Archived           bool
+	ArchivedAt         time.Time
+	Deprecated         bool
+	DeprecatedAt       time.Time
+	Added              bool
+	Removed            bool
+	Extinct            bool
+	Aliases            []string
+	ChangeType         string
+	Primary            ldapi.FeatureFlagConfig
+	LDInstance         string
+	ExtinctionsEnabled bool
 }
 
 func isNil(a interface{}) bool {
@@ -37,37 +44,54 @@ func isNil(a interface{}) bool {
 	return a == nil || reflect.ValueOf(a).IsNil()
 }
 
-func githubFlagComment(flag ldapi.FeatureFlag, aliases []string, added bool, config *config.Config) (string, error) {
+// Test go template rendering here https://gotemplate.io/
+func githubFlagComment(flag ldapi.FeatureFlag, aliases []string, added, extinct bool, config *lcr.Config) (string, error) {
 	commentTemplate := Comment{
-		Flag:       flag,
-		Added:      added,
-		Aliases:    aliases,
-		Primary:    flag.Environments[config.LdEnvironment],
-		LDInstance: config.LdInstance,
+		FlagKey:            flag.Key,
+		FlagName:           flag.Name,
+		Archived:           flag.Archived,
+		Deprecated:         flag.Deprecated,
+		Added:              added,
+		Removed:            !added,
+		Extinct:            config.CheckExtinctions && extinct,
+		Aliases:            aliases,
+		Primary:            flag.Environments[config.LdEnvironment],
+		LDInstance:         config.LdInstance,
+		ExtinctionsEnabled: config.CheckExtinctions,
 	}
-	var commentBody bytes.Buffer
 	if flag.ArchivedDate != nil {
 		commentTemplate.ArchivedAt = time.UnixMilli(*flag.ArchivedDate)
 	}
+	if flag.DeprecatedDate != nil {
+		commentTemplate.DeprecatedAt = time.UnixMilli(*flag.DeprecatedDate)
+	}
+
 	// All whitespace for template is required to be there or it will not render properly nested.
-	tmplSetup := `| {{- if eq .Flag.Archived true}}{{- if eq .Added true}} :warning:{{- end}}{{- end}}` +
-		` [{{.Flag.Name}}]({{.LDInstance}}{{.Primary.Site.Href}})` +
-		`{{- if eq .Flag.Archived true}}` +
-		` (archived on {{.ArchivedAt | date "2006-01-02"}})` +
-		`{{- end}} | ` +
-		"`" + `{{.Flag.Key}}` + "` |" +
+	tmplSetup := `| [{{.FlagName}}]({{.LDInstance}}{{.Primary.Site.Href}}) | ` +
+		"`" + `{{.FlagKey}}` + "` |" +
 		`{{- if ne (len .Aliases) 0}}` +
 		`{{range $i, $e := .Aliases }}` + `{{if $i}},{{end}}` + " `" + `{{$e}}` + "`" + `{{end}}` +
-		`{{- end}} |`
+		`{{- end}} | ` + infoCellTemplate() + ` |`
 
 	tmpl := template.Must(template.New("comment").Funcs(template.FuncMap{"trim": strings.TrimSpace, "isNil": isNil}).Funcs(sprig.FuncMap()).Parse(tmplSetup))
-	err := tmpl.Execute(&commentBody, commentTemplate)
-	if err != nil {
+
+	var commentBody bytes.Buffer
+	if err := tmpl.Execute(&commentBody, commentTemplate); err != nil {
 		return "", err
 	}
+
 	commentStr := html.UnescapeString(commentBody.String())
 
 	return commentStr, nil
+}
+
+// Template for info cell
+// Will only show deprecated warning if flag is not archived
+func infoCellTemplate() string {
+	return `{{- if eq .Extinct true}} :white_check_mark: all references removed` +
+		`{{- else if and .Removed .ExtinctionsEnabled}} :warning: not all references removed {{- end}} ` +
+		`{{- if eq .Archived true}}{{- if eq .Extinct true}}<br>{{- else if and .Removed .ExtinctionsEnabled }}<br>{{- end}}{{- if eq .Added true}} :warning:{{else}} :information_source:{{- end}} archived on {{.ArchivedAt | date "2006-01-02"}} ` +
+		`{{- else if eq .Deprecated true}}{{- if eq .Extinct true}}<br>{{- else if and .Removed .ExtinctionsEnabled }}<br>{{- end}}{{- if eq .Added true}} :warning:{{else}} :information_source:{{- end}} deprecated on {{.DeprecatedAt | date "2006-01-02"}}{{- end}}`
 }
 
 func GithubNoFlagComment() *github.IssueComment {
@@ -85,8 +109,8 @@ type FlagComments struct {
 	CommentsRemoved []string
 }
 
-func BuildFlagComment(buildComment FlagComments, flagsRef lflags.FlagsRef, existingComment *github.IssueComment) string {
-	tableHeader := "| Name | Key | Aliases found |\n| --- | --- | --- |"
+func BuildFlagComment(buildComment FlagComments, flagsRef refs.ReferenceSummary, existingComment *github.IssueComment) string {
+	tableHeader := "| Name | Key | Aliases found | Info |\n| --- | --- | --- | --- |"
 
 	var commentStr []string
 	commentStr = append(commentStr, "## LaunchDarkly flag references")
@@ -114,7 +138,7 @@ func BuildFlagComment(buildComment FlagComments, flagsRef lflags.FlagsRef, exist
 
 	hash := md5.Sum([]byte(postedComments))
 	if existingComment != nil && strings.Contains(*existingComment.Body, hex.EncodeToString(hash[:])) {
-		log.Println("comment already exists")
+		gha.Log("comment already exists")
 		return ""
 	}
 
@@ -122,38 +146,28 @@ func BuildFlagComment(buildComment FlagComments, flagsRef lflags.FlagsRef, exist
 	return postedComments
 }
 
-func ProcessFlags(flagsRef lflags.FlagsRef, flags []ldapi.FeatureFlag, config *lcr.Config) FlagComments {
+func ProcessFlags(flagsRef refs.ReferenceSummary, flags []ldapi.FeatureFlag, config *lcr.Config) FlagComments {
 	buildComment := FlagComments{}
-	addedKeys := make([]string, 0, len(flagsRef.FlagsAdded))
-	for key := range flagsRef.FlagsAdded {
-		addedKeys = append(addedKeys, key)
-	}
-	// sort keys so hashing can work for checking if comment already exists
-	sort.Strings(addedKeys)
-	for _, flagKey := range addedKeys {
-		// If flag is in both added and removed then it is being modified
-		delete(flagsRef.FlagsRemoved, flagKey)
-		flagAliases := uniqueAliases(flagsRef.FlagsAdded[flagKey])
+
+	for _, flagKey := range flagsRef.AddedKeys() {
+		flagAliases := flagsRef.FlagsAdded[flagKey]
 		idx, _ := find(flags, flagKey)
-		createComment, err := githubFlagComment(flags[idx], flagAliases, true, config)
+		createComment, err := githubFlagComment(flags[idx], flagAliases, true, false, config)
+		if err != nil {
+			gha.LogError(err)
+		}
 		buildComment.CommentsAdded = append(buildComment.CommentsAdded, createComment)
-		if err != nil {
-			log.Println(err)
-		}
 	}
-	removedKeys := make([]string, 0, len(flagsRef.FlagsRemoved))
-	for key := range flagsRef.FlagsRemoved {
-		removedKeys = append(removedKeys, key)
-	}
-	sort.Strings(removedKeys)
-	for _, flagKey := range removedKeys {
-		flagAliases := uniqueAliases(flagsRef.FlagsRemoved[flagKey])
+
+	for _, flagKey := range flagsRef.RemovedKeys() {
+		flagAliases := flagsRef.FlagsRemoved[flagKey]
 		idx, _ := find(flags, flagKey)
-		removedComment, err := githubFlagComment(flags[idx], flagAliases, false, config)
-		buildComment.CommentsRemoved = append(buildComment.CommentsRemoved, removedComment)
+		extinct := flagsRef.IsExtinct(flagKey)
+		removedComment, err := githubFlagComment(flags[idx], flagAliases, false, extinct, config)
 		if err != nil {
-			log.Println(err)
+			gha.LogError(err)
 		}
+		buildComment.CommentsRemoved = append(buildComment.CommentsRemoved, removedComment)
 	}
 
 	return buildComment
@@ -168,7 +182,7 @@ func find(slice []ldapi.FeatureFlag, val string) (int, bool) {
 	return -1, false
 }
 
-func uniqueFlagKeys(a, b lflags.FlagAliasMap) []string {
+func uniqueFlagKeys(a, b refs.FlagAliasMap) []string {
 	maxKeys := len(a) + len(b)
 	allKeys := make([]string, 0, maxKeys)
 	for k := range a {
@@ -182,16 +196,6 @@ func uniqueFlagKeys(a, b lflags.FlagAliasMap) []string {
 	}
 
 	return allKeys
-}
-
-func uniqueAliases(aliases lflags.AliasSet) []string {
-	flagAliases := make([]string, 0, len(aliases))
-	for alias := range aliases {
-		if len(strings.TrimSpace(alias)) > 0 {
-			flagAliases = append(flagAliases, alias)
-		}
-	}
-	return flagAliases
 }
 
 func pluralize(str string, strLength int) string {

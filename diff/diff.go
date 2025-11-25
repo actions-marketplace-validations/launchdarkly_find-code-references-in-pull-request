@@ -5,20 +5,38 @@ import (
 	"os"
 	"strings"
 
-	lflags "github.com/launchdarkly/find-code-references-in-pull-request/flags"
-	"github.com/launchdarkly/find-code-references-in-pull-request/ignore"
+	i "github.com/launchdarkly/find-code-references-in-pull-request/ignore"
+	gha "github.com/launchdarkly/find-code-references-in-pull-request/internal/github_actions"
+	refs "github.com/launchdarkly/find-code-references-in-pull-request/internal/references"
+	diff_util "github.com/launchdarkly/find-code-references-in-pull-request/internal/utils/diff_util"
+	"github.com/launchdarkly/ld-find-code-refs/v2/aliases"
 	lsearch "github.com/launchdarkly/ld-find-code-refs/v2/search"
 	"github.com/sourcegraph/go-diff/diff"
 )
 
-type DiffPaths struct {
-	FileToParse string
-	Skip        bool
+func PreprocessDiffs(dir string, multiFiles []*diff.FileDiff) aliases.FileContentsMap {
+	diffMap := make(map[string][]byte, len(multiFiles))
+
+	for _, parsedDiff := range multiFiles {
+		filePath, ignore := checkDiffFile(parsedDiff, dir)
+		if ignore {
+			continue
+		}
+
+		if _, ok := diffMap[filePath]; !ok {
+			diffMap[filePath] = make([]byte, 0)
+		}
+
+		for _, hunk := range parsedDiff.Hunks {
+			diffMap[filePath] = append(diffMap[filePath], hunk.Body...)
+		}
+	}
+
+	return diffMap
 }
 
-func CheckDiff(parsedDiff *diff.FileDiff, workspace string) *DiffPaths {
-	diffPaths := DiffPaths{}
-	allIgnores := ignore.NewIgnore(workspace)
+func checkDiffFile(parsedDiff *diff.FileDiff, workspace string) (filePath string, ignore bool) {
+	allIgnores := i.NewIgnore(workspace)
 
 	// If file is being renamed we don't want to check it for flags.
 	parsedFileA := strings.SplitN(parsedDiff.OrigName, "/", 2)
@@ -26,85 +44,50 @@ func CheckDiff(parsedDiff *diff.FileDiff, workspace string) *DiffPaths {
 	fullPathToA := workspace + "/" + parsedFileA[1]
 	fullPathToB := workspace + "/" + parsedFileB[1]
 	info, err := os.Stat(fullPathToB)
+	if err != nil {
+		fmt.Println(err)
+	}
 	var isDir bool
 	// If there is no 'b' parse 'a', means file is deleted.
 	if info == nil {
 		isDir = false
-		diffPaths.FileToParse = fullPathToA
+		filePath = fullPathToA
 	} else {
 		isDir = info.IsDir()
-		diffPaths.FileToParse = fullPathToB
-	}
-	if err != nil {
-		fmt.Println(err)
+		filePath = fullPathToB
 	}
 	// Similar to ld-find-code-refs do not match dotfiles, and read in ignore files.
-	if strings.HasPrefix(parsedFileB[1], ".") && strings.HasPrefix(parsedFileA[1], ".") || allIgnores.Match(diffPaths.FileToParse, isDir) {
-		diffPaths.Skip = true
+	if strings.HasPrefix(parsedFileB[1], ".") && strings.HasPrefix(parsedFileA[1], ".") || allIgnores.Match(filePath, isDir) {
+		return filePath, true
 	}
 	// We don't want to run on renaming of files.
 	if (parsedFileA[1] != parsedFileB[1]) && (!strings.Contains(parsedFileB[1], "dev/null") && !strings.Contains(parsedFileA[1], "dev/null")) {
-		diffPaths.Skip = true
+		return filePath, true
 	}
 
-	return &diffPaths
+	return filePath, false
 }
 
-func ProcessDiffs(matcher lsearch.Matcher, hunk *diff.Hunk, flagsRef lflags.FlagsRef, maxFlags int) {
-	flagMap := map[Operation]lflags.FlagAliasMap{
-		Add:    flagsRef.FlagsAdded,
-		Delete: flagsRef.FlagsRemoved,
-	}
-	diffLines := strings.Split(string(hunk.Body), "\n")
+func ProcessDiffs(matcher lsearch.Matcher, contents []byte, builder *refs.ReferenceSummaryBuilder) {
+	diffLines := strings.Split(string(contents), "\n")
 	for _, line := range diffLines {
-		if flagsRef.Count() >= maxFlags {
-			break
-		}
-
-		op := operation(line)
-		if op == Equal {
+		op := diff_util.LineOperation(line)
+		if op == diff_util.OperationEqual {
 			continue
 		}
 
 		// only one for now
 		elementMatcher := matcher.Elements[0]
 		for _, flagKey := range elementMatcher.FindMatches(line) {
-			if _, ok := flagMap[op][flagKey]; !ok {
-				flagMap[op][flagKey] = make(lflags.AliasSet)
-			}
-			if aliasMatches := matcher.FindAliases(line, flagKey); len(aliasMatches) > 0 {
-				if _, ok := flagMap[op][flagKey]; !ok {
-					flagMap[op][flagKey] = make(lflags.AliasSet)
-				}
-				for _, alias := range aliasMatches {
-					flagMap[op][flagKey][alias] = true
-				}
+			aliasMatches := elementMatcher.FindAliases(line, flagKey)
+			gha.Debug("Found (%s) reference to flag %s with aliases %v", op, flagKey, aliasMatches)
+			err := builder.AddReference(flagKey, op, aliasMatches)
+			if err != nil {
+				fmt.Println(err)
 			}
 		}
+		if builder.MaxReferences() {
+			break
+		}
 	}
-	flagsRef.FlagsAdded = flagMap[Add]
-	flagsRef.FlagsRemoved = flagMap[Delete]
-}
-
-// Operation defines the operation of a diff item.
-type Operation int
-
-const (
-	// Equal item represents an equals diff.
-	Equal Operation = iota
-	// Add item represents an insert diff.
-	Add
-	// Delete item represents a delete diff.
-	Delete
-)
-
-func operation(row string) Operation {
-	if strings.HasPrefix(row, "+") {
-		return Add
-	}
-	if strings.HasPrefix(row, "-") {
-		return Delete
-	}
-
-	return Equal
 }

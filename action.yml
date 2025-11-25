@@ -38,10 +38,17 @@ inputs:
     required: false
     default: '5'
   base-uri:
-    description: The base URI for the LaunchDarkly server. Most users should use the default value.
+    description: The base URI for the LaunchDarkly server. Most members should use the default value.
     required: false
     default: 'https://app.launchdarkly.com'
-
+  check-extinctions:
+    description: Check if removed flags still exist in codebase
+    required: false
+    default: 'true'
+  create-flag-links:
+    description: Create links to flags in LaunchDarkly. To use this feature you must use an access token with the `createFlagLink` role. To learn more, read [Flag links](https://docs.launchdarkly.com/home/organize/links).
+    required: false
+    default: 'true'
 outputs:
   any-modified:
     description: Returns true if any flags have been added or modified in PR
@@ -61,3 +68,9 @@ outputs:
     description: Space-separated list of flags changed in PR
   changed-flags-count:
     description: Number of flags changed in PR
+  any-extinct:
+    description: Returns true if any flags have been removed in PR and no longer exist in codebase. Only returned if `check-extinctions` is true.
+  extinct-flags:
+    description: Space-separated list of flags removed in PR and no longer exist in codebase. Only returned if `check-extinctions` is true.
+  extinct-flags-count:
+    description: Number of flags removed in PR and no longer exist in codebase. Only returned if `check-extinctions` is true.

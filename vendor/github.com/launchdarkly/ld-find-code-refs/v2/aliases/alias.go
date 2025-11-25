@@ -7,19 +7,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/iancoleman/strcase"
+	regexp "github.com/wasilibs/go-re2"
 
 	"github.com/launchdarkly/ld-find-code-refs/v2/internal/helpers"
 	"github.com/launchdarkly/ld-find-code-refs/v2/internal/log"
 	"github.com/launchdarkly/ld-find-code-refs/v2/internal/validation"
 	"github.com/launchdarkly/ld-find-code-refs/v2/options"
 )
+
+var globCache = make(map[string][]string)
+var regexCache = make(map[string]*regexp.Regexp)
 
 // GenerateAliases returns a map of flag keys to aliases based on config.
 func GenerateAliases(flags []string, aliases []options.Alias, dir string) (map[string][]string, error) {
@@ -45,40 +48,52 @@ func GenerateAliases(flags []string, aliases []options.Alias, dir string) (map[s
 	return ret, nil
 }
 
-func generateAlias(a options.Alias, flag, dir string, allFileContents map[string][]byte) (ret []string, err error) {
+func generateAlias(a options.Alias, flag, dir string, allFileContents FileContentsMap) (ret []string, err error) {
 	switch a.Type.Canonical() {
 	case options.Literal:
 		ret = a.Flags[flag]
-	case options.CamelCase:
-		ret = []string{strcase.ToLowerCamel(flag)}
-	case options.PascalCase:
-		ret = []string{strcase.ToCamel(flag)}
-	case options.SnakeCase:
-		ret = []string{strcase.ToSnake(flag)}
-	case options.UpperSnakeCase:
-		ret = []string{strcase.ToScreamingSnake(flag)}
-	case options.KebabCase:
-		ret = []string{strcase.ToKebab(flag)}
-	case options.DotCase:
-		ret = []string{strcase.ToDelimited(flag, '.')}
 	case options.FilePattern:
-		ret, err = generateAliasesFromFilePattern(a, flag, dir, allFileContents)
+		ret, err = GenerateAliasesFromFilePattern(a, flag, dir, allFileContents)
 	case options.Command:
-		ret, err = generateAliasesFromCommand(a, flag, dir)
+		ret, err = GenerateAliasesFromCommand(a, flag, dir)
+	default:
+		var alias string
+		alias, err = GenerateNamingConventionAlias(a, flag)
+		ret = []string{alias}
 	}
 
 	return ret, err
 }
 
-func generateAliasesFromFilePattern(a options.Alias, flag, dir string, allFileContents map[string][]byte) ([]string, error) {
+func GenerateNamingConventionAlias(a options.Alias, flag string) (alias string, err error) {
+	switch a.Type.Canonical() {
+	case options.CamelCase:
+		alias = strcase.ToLowerCamel(flag)
+	case options.PascalCase:
+		alias = strcase.ToCamel(flag)
+	case options.SnakeCase:
+		alias = strcase.ToSnake(flag)
+	case options.UpperSnakeCase:
+		alias = strcase.ToScreamingSnake(flag)
+	case options.KebabCase:
+		alias = strcase.ToKebab(flag)
+	case options.DotCase:
+		alias = strcase.ToDelimited(flag, '.')
+	default:
+		err = fmt.Errorf("naming convention alias type %s not recognized", a.Type)
+	}
+
+	return alias, err
+}
+
+func GenerateAliasesFromFilePattern(a options.Alias, flag, dir string, allFileContents FileContentsMap) ([]string, error) {
 	ret := []string{}
 	// Concatenate the contents of all files into a single byte array to be matched by specified patterns
 	fileContents := []byte{}
 	for _, path := range a.Paths {
-		absGlob := filepath.Join(dir, path)
-		matches, err := doublestar.FilepathGlob(absGlob)
+		matches, err := cacheFilepathGlob(dir, path)
 		if err != nil {
-			return nil, fmt.Errorf("filepattern '%s': could not process path glob '%s'", a.Name, absGlob)
+			return nil, fmt.Errorf("filepattern '%s': could not process path glob '%s'", a.Name, path)
 		}
 		for _, match := range matches {
 			if pathFileContents := allFileContents[match]; len(pathFileContents) > 0 {
@@ -88,7 +103,12 @@ func generateAliasesFromFilePattern(a options.Alias, flag, dir string, allFileCo
 	}
 
 	for _, p := range a.Patterns {
-		pattern := regexp.MustCompile(strings.ReplaceAll(p, "FLAG_KEY", flag))
+		patternStr := strings.ReplaceAll(p, "FLAG_KEY", flag)
+		pattern, ok := regexCache[patternStr]
+		if !ok {
+			pattern = regexp.MustCompile(patternStr)
+			regexCache[patternStr] = pattern
+		}
 		results := pattern.FindAllStringSubmatch(string(fileContents), -1)
 		for _, res := range results {
 			if len(res) > 1 {
@@ -100,7 +120,7 @@ func generateAliasesFromFilePattern(a options.Alias, flag, dir string, allFileCo
 	return ret, nil
 }
 
-func generateAliasesFromCommand(a options.Alias, flag, dir string) ([]string, error) {
+func GenerateAliasesFromCommand(a options.Alias, flag, dir string) ([]string, error) {
 	ret := []string{}
 	ctx := context.Background()
 	if a.Timeout != nil && *a.Timeout > 0 {
@@ -120,17 +140,17 @@ func generateAliasesFromCommand(a options.Alias, flag, dir string) ([]string, er
 	cmd.Dir = dir
 	stdout, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("filepattern '%s': failed to execute alias command: %w", a.Name, err)
+		return nil, fmt.Errorf("command '%s': failed to execute alias command: %w", a.Name, err)
 	}
 	if err := json.Unmarshal(stdout, &ret); err != nil {
-		return nil, fmt.Errorf("filepattern '%s': could not unmarshal json output of alias command: %w", a.Name, err)
+		return nil, fmt.Errorf("command '%s': could not unmarshal json output of alias command: %w", a.Name, err)
 	}
 
 	return ret, err
 }
 
 // processFileContent reads and stores the content of files specified by filePattern alias matchers to be matched for aliases
-func processFileContent(aliases []options.Alias, dir string) (map[string][]byte, error) {
+func processFileContent(aliases []options.Alias, dir string) (FileContentsMap, error) {
 	allFileContents := map[string][]byte{}
 	for idx, a := range aliases {
 		if a.Type.Canonical() != options.FilePattern {
@@ -144,13 +164,12 @@ func processFileContent(aliases []options.Alias, dir string) (map[string][]byte,
 
 		paths := []string{}
 		for _, glob := range a.Paths {
-			absGlob := filepath.Join(dir, glob)
-			matches, err := doublestar.FilepathGlob(absGlob)
+			matches, err := cacheFilepathGlob(dir, glob)
 			if err != nil {
-				return nil, fmt.Errorf("filepattern '%s': could not process path glob '%s'", aliasId, absGlob)
+				return nil, fmt.Errorf("filepattern '%s': could not process path glob '%s'", aliasId, glob)
 			}
 			if matches == nil {
-				log.Info.Printf("filepattern '%s': no matching files found for alias path glob '%s'", aliasId, absGlob)
+				log.Info.Printf("filepattern '%s': no matching files found for alias path glob '%s'", aliasId, glob)
 			}
 			paths = append(paths, matches...)
 		}
@@ -174,4 +193,16 @@ func processFileContent(aliases []options.Alias, dir string) (map[string][]byte,
 		}
 	}
 	return allFileContents, nil
+}
+
+func cacheFilepathGlob(dir, glob string) ([]string, error) {
+	absGlob := filepath.Join(dir, glob)
+	if cachedMatches, ok := globCache[absGlob]; ok {
+		return cachedMatches, nil
+	}
+
+	matches, err := doublestar.FilepathGlob(absGlob)
+	globCache[absGlob] = matches
+
+	return matches, err
 }

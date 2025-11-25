@@ -3,13 +3,15 @@ package config
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v68/github"
+
 	"golang.org/x/oauth2"
+
+	gha "github.com/launchdarkly/find-code-references-in-pull-request/internal/github_actions"
 )
 
 type Config struct {
@@ -24,19 +26,26 @@ type Config struct {
 	MaxFlags             int
 	PlaceholderComment   bool
 	IncludeArchivedFlags bool
+	CheckExtinctions     bool
+	CreateFlagLinks      bool
 }
 
 func ValidateInputandParse(ctx context.Context) (*Config, error) {
 	// mask tokens
 	if accessToken := os.Getenv("INPUT_ACCESS-TOKEN"); len(accessToken) > 0 {
-		fmt.Printf("::add-mask::%s\n", accessToken)
+		gha.MaskInput(accessToken)
 	}
 	if repoToken := os.Getenv("INPUT_REPO-TOKEN"); len(repoToken) > 0 {
-		fmt.Printf("::add-mask::%s\n", repoToken)
+		gha.MaskInput(repoToken)
 	}
 
-	// set config
-	var config Config
+	// init config with defaults
+	config := Config{
+		MaxFlags:             5,
+		IncludeArchivedFlags: true,
+		CheckExtinctions:     true,
+	}
+
 	config.LdProject = os.Getenv("INPUT_PROJECT-KEY")
 	if config.LdProject == "" {
 		return nil, errors.New("`project-key` is required")
@@ -74,20 +83,42 @@ func ValidateInputandParse(ctx context.Context) (*Config, error) {
 		config.PlaceholderComment = placholderComment
 	}
 
-	config.IncludeArchivedFlags = true
 	if includeArchivedFlags, err := strconv.ParseBool(os.Getenv("INPUT_INCLUDE-ARCHIVED-FLAGS")); err == nil {
 		// ignore error - default is true
 		config.IncludeArchivedFlags = includeArchivedFlags
 	}
 
-	config.GHClient = getGithubClient(ctx)
+	if checkExtinctions, err := strconv.ParseBool(os.Getenv("INPUT_CHECK-EXTINCTIONS")); err == nil {
+		// ignore error - default is true
+		config.CheckExtinctions = checkExtinctions
+	}
+
+	if createFlagLinks, err := strconv.ParseBool(os.Getenv("INPUT_CREATE-FLAG-LINKS")); err == nil {
+		// ignore error - default is false
+		config.CreateFlagLinks = createFlagLinks
+	}
+
+	client, err := getGithubClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	config.GHClient = client
+
 	return &config, nil
 }
 
-func getGithubClient(ctx context.Context) *github.Client {
+func getGithubClient(ctx context.Context) (*github.Client, error) {
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: os.Getenv("GITHUB_TOKEN")},
 	)
 	tc := oauth2.NewClient(ctx, ts)
-	return github.NewClient(tc)
+	gc := github.NewClient(tc)
+
+	host := os.Getenv("GITHUB_SERVER_URL")
+	if host != "https://github.com" && host != "" {
+		gha.Log("Using GitHub Enterprise host. baseUrl: %s, uploadUrl: %s", host+"/api/v3/", host+"/api/uploads/")
+		return gc.WithEnterpriseURLs(host+"/api/v3/", host+"/api/uploads/")
+	}
+
+	return gc, nil
 }

@@ -3,9 +3,9 @@ package diff
 import (
 	"testing"
 
-	ldapi "github.com/launchdarkly/api-client-go/v13"
+	ldapi "github.com/launchdarkly/api-client-go/v15"
 	"github.com/launchdarkly/find-code-references-in-pull-request/config"
-	lflags "github.com/launchdarkly/find-code-references-in-pull-request/flags"
+	refs "github.com/launchdarkly/find-code-references-in-pull-request/internal/references"
 	lsearch "github.com/launchdarkly/ld-find-code-refs/v2/search"
 	"github.com/sourcegraph/go-diff/diff"
 	"github.com/stretchr/testify/assert"
@@ -36,9 +36,9 @@ func createFlag(key string) ldapi.FeatureFlag {
 }
 
 type testProcessor struct {
-	Flags    ldapi.FeatureFlags
-	FlagsRef lflags.FlagsRef
-	Config   config.Config
+	Flags   ldapi.FeatureFlags
+	Config  config.Config
+	Builder *refs.ReferenceSummaryBuilder
 }
 
 func (t testProcessor) flagKeys() []string {
@@ -55,25 +55,19 @@ func newProcessFlagAccEnv() *testProcessor {
 	flags := ldapi.FeatureFlags{}
 	flags.Items = append(flags.Items, flag)
 	flags.Items = append(flags.Items, flag2)
-	flagsAdded := make(lflags.FlagAliasMap)
-	flagsRemoved := make(lflags.FlagAliasMap)
-	flagsRef := lflags.FlagsRef{
-		FlagsAdded:   flagsAdded,
-		FlagsRemoved: flagsRemoved,
-	}
-
+	builder := refs.NewReferenceSummaryBuilder(5, false)
 	config := config.Config{
 		LdEnvironment: "production",
 		LdInstance:    "https://example.com/",
 	}
 	return &testProcessor{
-		Flags:    flags,
-		FlagsRef: flagsRef,
-		Config:   config,
+		Flags:   flags,
+		Config:  config,
+		Builder: builder,
 	}
 }
 
-func TestCheckDiff(t *testing.T) {
+func Test_checkDiffFile(t *testing.T) {
 	cases := []struct {
 		name     string
 		fileName string
@@ -111,25 +105,27 @@ func TestCheckDiff(t *testing.T) {
 				NewName:  tc.newName,
 				Hunks:    []*diff.Hunk{hunk},
 			}
-			results := CheckDiff(&diff, "../testdata")
-			assert.Equal(t, &DiffPaths{FileToParse: "../testdata/" + tc.fileName, Skip: tc.skip}, results, "")
+			filePath, ignore := checkDiffFile(&diff, "../testdata")
+			expectedFilePath := "../testdata/" + tc.fileName
+			assert.Equal(t, expectedFilePath, filePath)
+			assert.Equal(t, tc.skip, ignore)
 		})
 	}
 }
 
-func TestProcessDiffs(t *testing.T) {
+func TestProcessDiffs_BuildReferences(t *testing.T) {
 	cases := []struct {
 		name       string
 		sampleBody string
-		expected   lflags.FlagsRef
+		expected   refs.ReferenceSummary
 		aliases    map[string][]string
 		delimiters string
 	}{
 		{
 			name: "add flag",
-			expected: lflags.FlagsRef{
-				FlagsAdded:   lflags.FlagAliasMap{"example-flag": lflags.AliasSet{}},
-				FlagsRemoved: lflags.FlagAliasMap{},
+			expected: refs.ReferenceSummary{
+				FlagsAdded:   refs.FlagAliasMap{"example-flag": []string{}},
+				FlagsRemoved: refs.FlagAliasMap{},
 			},
 			aliases: map[string][]string{},
 			sampleBody: `
@@ -143,9 +139,9 @@ func TestProcessDiffs(t *testing.T) {
 		},
 		{
 			name: "remove flag",
-			expected: lflags.FlagsRef{
-				FlagsAdded:   lflags.FlagAliasMap{},
-				FlagsRemoved: lflags.FlagAliasMap{"example-flag": lflags.AliasSet{}},
+			expected: refs.ReferenceSummary{
+				FlagsAdded:   refs.FlagAliasMap{},
+				FlagsRemoved: refs.FlagAliasMap{"example-flag": []string{}},
 			},
 			aliases: map[string][]string{},
 			sampleBody: `
@@ -159,9 +155,9 @@ func TestProcessDiffs(t *testing.T) {
 		},
 		{
 			name: "add and remove flag",
-			expected: lflags.FlagsRef{
-				FlagsAdded:   lflags.FlagAliasMap{"sample-flag": lflags.AliasSet{}},
-				FlagsRemoved: lflags.FlagAliasMap{"example-flag": lflags.AliasSet{}},
+			expected: refs.ReferenceSummary{
+				FlagsAdded:   refs.FlagAliasMap{"sample-flag": []string{}},
+				FlagsRemoved: refs.FlagAliasMap{"example-flag": []string{}},
 			},
 			aliases: map[string][]string{},
 			sampleBody: `
@@ -176,9 +172,9 @@ func TestProcessDiffs(t *testing.T) {
 		},
 		{
 			name: "modified flag",
-			expected: lflags.FlagsRef{
-				FlagsAdded:   lflags.FlagAliasMap{"example-flag": lflags.AliasSet{}},
-				FlagsRemoved: lflags.FlagAliasMap{"example-flag": lflags.AliasSet{}},
+			expected: refs.ReferenceSummary{
+				FlagsAdded:   refs.FlagAliasMap{"example-flag": []string{}},
+				FlagsRemoved: refs.FlagAliasMap{},
 			},
 			aliases: map[string][]string{},
 			sampleBody: `
@@ -194,9 +190,9 @@ func TestProcessDiffs(t *testing.T) {
 		},
 		{
 			name: "alias flag",
-			expected: lflags.FlagsRef{
-				FlagsAdded:   lflags.FlagAliasMap{"example-flag": lflags.AliasSet{"exampleFlag": true}},
-				FlagsRemoved: lflags.FlagAliasMap{},
+			expected: refs.ReferenceSummary{
+				FlagsAdded:   refs.FlagAliasMap{"example-flag": []string{"exampleFlag"}},
+				FlagsRemoved: refs.FlagAliasMap{},
 			},
 			aliases: map[string][]string{"example-flag": {"exampleFlag"}},
 			sampleBody: `
@@ -209,9 +205,9 @@ func TestProcessDiffs(t *testing.T) {
 		},
 		{
 			name: "require delimiters - no matches",
-			expected: lflags.FlagsRef{
-				FlagsAdded:   lflags.FlagAliasMap{},
-				FlagsRemoved: lflags.FlagAliasMap{},
+			expected: refs.ReferenceSummary{
+				FlagsAdded:   refs.FlagAliasMap{},
+				FlagsRemoved: refs.FlagAliasMap{},
 			},
 			delimiters: "'\"",
 			aliases:    map[string][]string{},
@@ -224,9 +220,9 @@ func TestProcessDiffs(t *testing.T) {
 		},
 		{
 			name: "require delimiters - match",
-			expected: lflags.FlagsRef{
-				FlagsAdded:   lflags.FlagAliasMap{"example-flag": lflags.AliasSet{}},
-				FlagsRemoved: lflags.FlagAliasMap{},
+			expected: refs.ReferenceSummary{
+				FlagsAdded:   refs.FlagAliasMap{"example-flag": []string{}},
+				FlagsRemoved: refs.FlagAliasMap{},
 			},
 			delimiters: "'\"",
 			aliases:    map[string][]string{},
@@ -242,21 +238,14 @@ func TestProcessDiffs(t *testing.T) {
 	for _, tc := range cases {
 		processor := newProcessFlagAccEnv()
 		t.Run(tc.name, func(t *testing.T) {
-			hunk := &diff.Hunk{
-				NewLines:      1,
-				NewStartLine:  1,
-				OrigLines:     0,
-				OrigStartLine: 0,
-				StartPosition: 1,
-				Body:          []byte(tc.sampleBody),
-			}
 			elements := []lsearch.ElementMatcher{}
 			elements = append(elements, lsearch.NewElementMatcher("default", "", tc.delimiters, processor.flagKeys(), tc.aliases))
 			matcher := lsearch.Matcher{
 				Elements: elements,
 			}
-			ProcessDiffs(matcher, hunk, processor.FlagsRef, 5)
-			assert.Equal(t, tc.expected, processor.FlagsRef)
+			ProcessDiffs(matcher, []byte(tc.sampleBody), processor.Builder)
+			flagsRef := processor.Builder.Build()
+			assert.Equal(t, tc.expected, flagsRef)
 		})
 	}
 }
