@@ -1,5 +1,8 @@
 # Run test file with command:
 #   act pull_request -e testdata/act/pull-request.json
+#
+# Fork PRs only run jobs that do not need repository secrets here. See test-fork-pr.yml
+# for the label-gated workflow that runs go-test and e2e tests on forks.
 
 name: Test and Generate Docs
 
@@ -7,6 +10,7 @@ on: pull_request
 
 jobs:
   go-test:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -59,6 +63,7 @@ jobs:
             -- -tags=launchdarkly_easyjson -p=1
 
       - name: Publish JUnit Tests
+        if: github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/publish-junit
         env:
           DD_API_KEY: ${{ secrets.DATADOG_API_KEY }}
@@ -67,10 +72,12 @@ jobs:
           name: find-code-references-in-pull-request
           datadog: 'true'
           github: 'true'
-      
 
   e2e-tests:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
@@ -78,8 +85,8 @@ jobs:
         uses: ./ # Uses an action in the root directory
         id: find-flags
         with:
-          project-key: demo-dan-042021-2
-          environment-key: development
+          project-key: developer-toolbar-sandbox
+          environment-key: test
           access-token: ${{ secrets.LD_ACCESS_TOKEN_WRITER }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           base-uri: https://app.launchdarkly.com
