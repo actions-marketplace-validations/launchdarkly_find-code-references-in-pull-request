@@ -4,6 +4,19 @@
 
 ### Changed
 
+- Docker Hub image publish workflow loads credentials via `release-secrets` / SSM (same as other public LD images) instead of repo `DOCKERHUB_*` secrets
+
+### Fixed
+
+## 2.3.0
+
+### Added
+
+- optional GitHub Action entry point `launchdarkly/find-code-references-in-pull-request/docker` with a `dockerImage` input so workflows can pull a prebuilt runtime image from a private registry or Docker Hub proxy. The root Action is unchanged.
+- multi-stage `Dockerfile` and Docker Hub publish workflow for `launchdarkly/find-code-references-in-pull-request` runtime images
+
+### Changed
+
 ### Fixed
 
 ## 2.2.0
