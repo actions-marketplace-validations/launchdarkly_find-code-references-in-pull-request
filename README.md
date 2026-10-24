@@ -90,6 +90,7 @@ The root Action (`launchdarkly/find-code-references-in-pull-request@v2`) is a Do
 
 If your organization must pull images through an internal registry or Docker Hub proxy, use the optional **`docker`** entry point. It runs a **prebuilt** runtime image via `docker run` and accepts a `dockerImage` input. Mirror `launchdarkly/find-code-references-in-pull-request` into your registry first (pin the tag you mirrored).
 
+<!-- x-release-please-start-version -->
 ```yaml
 on: pull_request
 
@@ -108,15 +109,15 @@ jobs:
           password: ${{ secrets.REGISTRY_TOKEN }}
       - name: Find flags
         id: find-flags
-        # Pin to a release that includes the docker/ entry point and published image (see changelog).
-        uses: launchdarkly/find-code-references-in-pull-request/docker@v2.3.0
+        uses: launchdarkly/find-code-references-in-pull-request/docker@v2
         with:
           project-key: default
           environment-key: production
           access-token: ${{ secrets.LD_ACCESS_TOKEN }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-          dockerImage: your.registry.example/launchdarkly/find-code-references-in-pull-request:2.3.0
+          dockerImage: your.registry.example/launchdarkly/find-code-references-in-pull-request:2.3.4
 ```
+<!-- x-release-please-end -->
 
 This entry point requires a Docker CLI on the runner (included on GitHub-hosted `ubuntu-*` runners). Existing workflows that use the root Action do not need to change.
 

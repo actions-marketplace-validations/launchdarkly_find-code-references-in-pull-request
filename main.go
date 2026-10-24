@@ -38,7 +38,7 @@ func main() {
 		failExit(err)
 	}
 
-	flags, err := ldclient.GetAllFlags(config)
+	flags, err := ldclient.GetAllFlags(ctx, config)
 	failExit(err)
 
 	if len(flags) == 0 {
@@ -96,7 +96,7 @@ func main() {
 			Body: &postedComments,
 		}
 
-		if !config.SkipComment {
+		if config.SkipComment {
 			gha.Log("Skipping comment creation as skip-comment is set to true")
 		} else {
 			err = postGithubComment(ctx, flagsRef, config, existingComment, *event.PullRequest.Number, comment)
